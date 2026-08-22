@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
 using System.Diagnostics.CodeAnalysis;
@@ -60,6 +61,7 @@ public class DynamicHlsController : BaseJellyfinApiController
     private readonly IDynamicHlsPlaylistGenerator _dynamicHlsPlaylistGenerator;
     private readonly DynamicHlsHelper _dynamicHlsHelper;
     private readonly EncodingOptions _encodingOptions;
+    private readonly ConcurrentDictionary<string, DateTime> _segmentCleanupTimes = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Initializes a new instance of the <see cref="DynamicHlsController"/> class.
@@ -1455,16 +1457,22 @@ public class DynamicHlsController : BaseJellyfinApiController
 
         var segmentExtension = EncodingHelper.GetSegmentFileExtension(state.Request.SegmentContainer);
 
-        // Keep segment selection and transcoding replacement under the same playlist lock.
-        // An out-of-order request must not replace a job while another request is using its output.
+        TranscodingJob? job;
+
+        if (System.IO.File.Exists(segmentPath) && !IsSegmentStale(segmentPath, playlistPath))
+        {
+            job = _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
+            _logger.LogDebug("returning {0} [it exists, try 1]", segmentPath);
+            return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
+        }
+
         using (await _transcodeManager.LockAsync(playlistPath, cancellationToken).ConfigureAwait(false))
         {
-            TranscodingJob? job;
             var startTranscoding = false;
-            if (System.IO.File.Exists(segmentPath))
+            if (System.IO.File.Exists(segmentPath) && !IsSegmentStale(segmentPath, playlistPath))
             {
                 job = _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
-                _logger.LogDebug("returning {0} [it exists]", segmentPath);
+                _logger.LogDebug("returning {0} [it exists, try 2]", segmentPath);
                 return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
             }
 
@@ -1498,16 +1506,10 @@ public class DynamicHlsController : BaseJellyfinApiController
                 // If the playlist doesn't already exist, startup ffmpeg
                 try
                 {
-                    var currentJob = _transcodeManager.GetTranscodingJob(playlistPath, TranscodingJobType);
-                    await WaitForActiveTranscodingRequests(currentJob, cancellationToken).ConfigureAwait(false);
-
                     await _transcodeManager.KillTranscodingJobs(streamingRequest.DeviceId, streamingRequest.PlaySessionId, p => false)
                         .ConfigureAwait(false);
 
-                    if (currentTranscodingIndex.HasValue)
-                    {
-                        await DeleteLastFile(playlistPath, segmentExtension, 0).ConfigureAwait(false);
-                    }
+                    await DeleteExistingSegmentFiles(playlistPath, segmentExtension).ConfigureAwait(false);
 
                     streamingRequest.StartTimeTicks = streamingRequest.CurrentRuntimeTicks;
 
@@ -1536,11 +1538,11 @@ public class DynamicHlsController : BaseJellyfinApiController
                     await job.TranscodingThrottler.UnpauseTranscoding().ConfigureAwait(false);
                 }
             }
-
-            _logger.LogDebug("returning {0} [general case]", segmentPath);
-            job ??= _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
-            return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
         }
+
+        _logger.LogDebug("returning {0} [general case]", segmentPath);
+        job ??= _transcodeManager.OnTranscodeBeginRequest(playlistPath, TranscodingJobType);
+        return await GetSegmentResult(state, playlistPath, segmentPath, segmentExtension, segmentId, job, cancellationToken).ConfigureAwait(false);
     }
 
     internal static async Task WaitForActiveTranscodingRequests(TranscodingJob? job, CancellationToken cancellationToken)
@@ -1611,9 +1613,8 @@ public class DynamicHlsController : BaseJellyfinApiController
 
             if (state.VideoStream is not null && state.IsOutputVideo)
             {
-                // fMP4 needs frag_discont to write the audio packet DTS/PTS including the initial delay into MOOF::TRAF::TFDT
-                // HLS does not use SIDX, and skipping it avoids FFmpeg rewriting open-GOP boundary packet PTS
-                hlsArguments += $" {(useLegacySegmentOption ? "-hls_ts_options" : "-hls_segment_options")} movflags=+frag_discont+skip_sidx";
+                // fMP4 needs this flag to write the audio packet DTS/PTS including the initial delay into MOOF::TRAF::TFDT
+                hlsArguments += $" {(useLegacySegmentOption ? "-hls_ts_options" : "-hls_segment_options")} movflags=+frag_discont";
             }
 
             segmentFormat = "fmp4" + outputFmp4HeaderArg;
@@ -2045,6 +2046,36 @@ public class DynamicHlsController : BaseJellyfinApiController
         {
             return null;
         }
+    }
+
+    private async Task DeleteExistingSegmentFiles(string playlistPath, string segmentExtension)
+    {
+        var folder = Path.GetDirectoryName(playlistPath) ?? throw new ArgumentException("Path can't be a root directory.", nameof(playlistPath));
+        var filePrefix = Path.GetFileNameWithoutExtension(playlistPath);
+
+        IEnumerable<FileSystemMetadata> files;
+        try
+        {
+            files = _fileSystem.GetFiles(folder, new[] { segmentExtension }, true, false)
+                .Where(i => Path.GetFileNameWithoutExtension(i.Name).StartsWith(filePrefix, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+        catch (IOException)
+        {
+            return;
+        }
+
+        // Record cleanup time before deleting so any file written after this point
+        // is known to belong to the new session and won't be treated as stale.
+        _segmentCleanupTimes[playlistPath] = DateTime.UtcNow;
+
+        await Task.WhenAll(files.Select(f => Task.Run(() => DeleteFile(f.FullName, 0)))).ConfigureAwait(false);
+    }
+
+    private bool IsSegmentStale(string segmentPath, string playlistPath)
+    {
+        return _segmentCleanupTimes.TryGetValue(playlistPath, out var cleanupTime)
+            && System.IO.File.GetLastWriteTimeUtc(segmentPath) < cleanupTime;
     }
 
     private async Task DeleteLastFile(string playlistPath, string segmentExtension, int retryCount)
