@@ -785,7 +785,12 @@ namespace MediaBrowser.Controller.Entities
         {
             if (container is Series series)
             {
-                await series.RefreshMetadata(refreshOptions, cancellationToken).ConfigureAwait(false);
+                // Prime provider ids and display order before child refreshes run, but defer
+                // season and episode reconciliation until the final series refresh below.
+                using (SeriesMetadataRefreshScope.SuppressChildReconciliation())
+                {
+                    await series.RefreshMetadata(refreshOptions, cancellationToken).ConfigureAwait(false);
+                }
             }
 
             await container.RefreshAllMetadata(refreshOptions, progress, cancellationToken).ConfigureAwait(false);

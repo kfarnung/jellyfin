@@ -78,6 +78,11 @@ public class SeriesMetadataService : MetadataService<Series, SeriesInfo>
     {
         await base.AfterMetadataRefresh(item, refreshOptions, cancellationToken).ConfigureAwait(false);
 
+        if (SeriesMetadataRefreshScope.IsChildReconciliationSuppressed)
+        {
+            return;
+        }
+
         // Note that this only updates the children's SeriesPresentationUniqueKey and SeasonId, not the ParentIndexNumber
         if (LibraryManager.GetLibraryOptions(item).EnableAutomaticSeriesGrouping)
         {
